@@ -67,7 +67,8 @@ ${CROSS_PREFIX}g++ -shared \
     -L/opt/arm64/lib \
     -lkeyfinder \
     -lfftw3 \
-    -lm -lstdc++ \
+    -lm -lpthread \
+    -static-libstdc++ -static-libgcc \
     -o build/keydetect.so
 
 # Package

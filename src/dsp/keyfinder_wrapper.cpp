@@ -1,8 +1,9 @@
 /*
  * keyfinder_wrapper.cpp - C++ wrapper around libkeyfinder
  *
- * Implements the plain C API defined in keyfinder_wrapper.h using
- * libkeyfinder's progressive analysis pipeline.
+ * Audio thread is completely lock-free with zero-copy handoff (ping-pong).
+ * Audio is downsampled 4x before analysis to reduce CPU load.
+ * Analysis thread runs at low priority.
  */
 
 #include "keyfinder_wrapper.h"
@@ -13,46 +14,99 @@
 
 #include <cstring>
 #include <cstdlib>
-#include <vector>
+#include <thread>
+#include <atomic>
+#include <unistd.h>
+#include <sched.h>
 
 /* Key enum to display string mapping */
 static const char* key_names[] = {
-    "A maj",   /* A_MAJOR = 0 */
-    "A min",   /* A_MINOR */
-    "Bb maj",  /* B_FLAT_MAJOR */
-    "Bb min",  /* B_FLAT_MINOR */
-    "B maj",   /* B_MAJOR */
-    "B min",   /* B_MINOR = 5 */
-    "C maj",   /* C_MAJOR */
-    "C min",   /* C_MINOR */
-    "Db maj",  /* D_FLAT_MAJOR */
-    "Db min",  /* D_FLAT_MINOR */
-    "D maj",   /* D_MAJOR = 10 */
-    "D min",   /* D_MINOR */
-    "Eb maj",  /* E_FLAT_MAJOR */
-    "Eb min",  /* E_FLAT_MINOR */
-    "E maj",   /* E_MAJOR */
-    "E min",   /* E_MINOR = 15 */
-    "F maj",   /* F_MAJOR */
-    "F min",   /* F_MINOR */
-    "Gb maj",  /* G_FLAT_MAJOR */
-    "Gb min",  /* G_FLAT_MINOR */
-    "G maj",   /* G_MAJOR = 20 */
-    "G min",   /* G_MINOR */
-    "Ab maj",  /* A_FLAT_MAJOR */
-    "Ab min",  /* A_FLAT_MINOR */
-    "---"      /* SILENCE = 24 */
+    "A maj",  "A min",  "Bb maj", "Bb min",
+    "B maj",  "B min",  "C maj",  "C min",
+    "Db maj", "Db min", "D maj",  "D min",
+    "Eb maj", "Eb min", "E maj",  "E min",
+    "F maj",  "F min",  "Gb maj", "Gb min",
+    "G maj",  "G min",  "Ab maj", "Ab min",
+    "---"     /* SILENCE = 24 */
 };
 
+/*
+ * Downsample factor: feed libkeyfinder at ~11025 Hz instead of 44100 Hz.
+ * Key detection only needs pitch info up to ~4 kHz, so this is fine.
+ * Reduces FFT/analysis CPU by ~4x.
+ */
+#define DOWNSAMPLE 4
+#define EFFECTIVE_RATE (44100 / DOWNSAMPLE)  /* 11025 Hz */
+
+/* Max buffer: 8 seconds at downsampled rate */
+#define MAX_BUF_SAMPLES (8 * EFFECTIVE_RATE)  /* 88200 samples = ~690 KB */
+
 struct kd_context {
-    KeyFinder::KeyFinder keyfinder;
-    KeyFinder::Workspace workspace;
+    /* Ping-pong buffers: audio thread writes to one, analysis reads the other.
+     * No copy needed — just swap which index is active. */
+    double bufs[2][MAX_BUF_SAMPLES];
+    std::atomic<int> active_buf;       /* 0 or 1: which buf audio thread writes to */
+    int write_pos;                      /* position in active buf (only audio thread touches) */
+    int downsample_counter;             /* counts input frames for decimation */
+
+    /* Handoff flag: set by audio thread, cleared by analysis thread */
+    std::atomic<int> ready_buf;         /* -1 = none ready, 0 or 1 = buf index to analyze */
+    std::atomic<int> ready_len;         /* number of samples in ready buf */
+
+    /* Analysis thread */
+    std::thread worker;
+    std::atomic<bool> shutdown;
+
+    /* Result */
+    char detected_key[16];
+
+    /* Config */
     int sample_rate;
     float window_seconds;
-    int window_samples;         /* window_seconds * sample_rate */
-    std::vector<double> buffer; /* mono audio accumulation buffer */
-    char detected_key[16];      /* current key string */
+    int window_samples;                 /* at downsampled rate */
 };
+
+static void analysis_thread_fn(kd_context *ctx) {
+    /* Set low priority so we don't compete with audio */
+    nice(10);
+
+    KeyFinder::KeyFinder keyfinder;
+
+    while (!ctx->shutdown.load(std::memory_order_relaxed)) {
+        int buf_idx = ctx->ready_buf.load(std::memory_order_acquire);
+        if (buf_idx < 0) {
+            usleep(50000);  /* 50ms poll */
+            continue;
+        }
+
+        int len = ctx->ready_len.load(std::memory_order_relaxed);
+
+        /* Mark consumed immediately so audio thread can queue next */
+        ctx->ready_buf.store(-1, std::memory_order_release);
+
+        if (len <= 0) continue;
+
+        /* Build AudioData */
+        KeyFinder::AudioData audio;
+        audio.setChannels(1);
+        audio.setFrameRate(EFFECTIVE_RATE);
+        audio.addToSampleCount(len);
+
+        for (int i = 0; i < len; i++) {
+            audio.setSample(i, ctx->bufs[buf_idx][i]);
+        }
+
+        /* Run analysis */
+        KeyFinder::key_t key = keyfinder.keyOfAudio(audio);
+
+        if (key >= 0 && key <= KeyFinder::SILENCE) {
+            char tmp[16];
+            std::strncpy(tmp, key_names[key], sizeof(tmp) - 1);
+            tmp[sizeof(tmp) - 1] = '\0';
+            std::memcpy(ctx->detected_key, tmp, 16);
+        }
+    }
+}
 
 extern "C" {
 
@@ -62,15 +116,29 @@ void* kd_create(int sample_rate) {
 
     ctx->sample_rate = sample_rate;
     ctx->window_seconds = 2.0f;
-    ctx->window_samples = (int)(ctx->window_seconds * sample_rate);
-    ctx->buffer.reserve(ctx->window_samples);
+    ctx->window_samples = (int)(ctx->window_seconds * EFFECTIVE_RATE);
+    ctx->active_buf.store(0, std::memory_order_relaxed);
+    ctx->write_pos = 0;
+    ctx->downsample_counter = 0;
+    ctx->ready_buf.store(-1, std::memory_order_relaxed);
+    ctx->ready_len.store(0, std::memory_order_relaxed);
+    ctx->shutdown.store(false, std::memory_order_relaxed);
     std::strcpy(ctx->detected_key, "---");
+
+    ctx->worker = std::thread(analysis_thread_fn, ctx);
 
     return ctx;
 }
 
 void kd_destroy(void *ptr) {
     kd_context *ctx = (kd_context*)ptr;
+    if (!ctx) return;
+
+    ctx->shutdown.store(true, std::memory_order_relaxed);
+    if (ctx->worker.joinable()) {
+        ctx->worker.join();
+    }
+
     delete ctx;
 }
 
@@ -78,38 +146,34 @@ void kd_feed(void *ptr, const int16_t *stereo_audio, int frames) {
     kd_context *ctx = (kd_context*)ptr;
     if (!ctx || !stereo_audio || frames <= 0) return;
 
-    /* Downmix stereo int16 to mono double, append to buffer */
+    int buf_idx = ctx->active_buf.load(std::memory_order_relaxed);
+    double *buf = ctx->bufs[buf_idx];
+    int pos = ctx->write_pos;
+
     for (int i = 0; i < frames; i++) {
-        double left  = stereo_audio[i * 2]     / 32768.0;
-        double right = stereo_audio[i * 2 + 1] / 32768.0;
-        ctx->buffer.push_back((left + right) * 0.5);
+        /* Simple decimation: take every Nth sample */
+        if (ctx->downsample_counter == 0) {
+            double left  = stereo_audio[i * 2]     / 32768.0;
+            double right = stereo_audio[i * 2 + 1] / 32768.0;
+            buf[pos] = (left + right) * 0.5;
+            pos++;
+        }
+        ctx->downsample_counter = (ctx->downsample_counter + 1) % DOWNSAMPLE;
     }
 
-    /* Once we have enough audio, run analysis */
-    if ((int)ctx->buffer.size() >= ctx->window_samples) {
-        /* Build AudioData from buffer */
-        KeyFinder::AudioData audio;
-        audio.setChannels(1);
-        audio.setFrameRate(ctx->sample_rate);
-        audio.addToSampleCount(ctx->buffer.size());
-
-        for (size_t i = 0; i < ctx->buffer.size(); i++) {
-            audio.setSample(i, ctx->buffer[i]);
+    /* Check if we've filled a window */
+    if (pos >= ctx->window_samples) {
+        /* Hand off: only if analysis thread is idle */
+        if (ctx->ready_buf.load(std::memory_order_relaxed) < 0) {
+            ctx->ready_len.store(pos, std::memory_order_relaxed);
+            ctx->ready_buf.store(buf_idx, std::memory_order_release);
+            /* Swap to other buffer — zero copy */
+            ctx->active_buf.store(1 - buf_idx, std::memory_order_relaxed);
         }
-
-        /* Run full analysis on the window */
-        KeyFinder::key_t key = ctx->keyfinder.keyOfAudio(audio);
-
-        /* Map enum to string */
-        if (key >= 0 && key <= KeyFinder::SILENCE) {
-            std::strncpy(ctx->detected_key, key_names[key],
-                         sizeof(ctx->detected_key) - 1);
-            ctx->detected_key[sizeof(ctx->detected_key) - 1] = '\0';
-        }
-
-        /* Clear buffer for next window */
-        ctx->buffer.clear();
+        pos = 0;
     }
+
+    ctx->write_pos = pos;
 }
 
 int kd_get_key(void *ptr, char *buf, int buf_len) {
@@ -131,10 +195,10 @@ void kd_set_window(void *ptr, float seconds) {
     if (seconds > 8.0f) seconds = 8.0f;
 
     ctx->window_seconds = seconds;
-    ctx->window_samples = (int)(seconds * ctx->sample_rate);
-
-    /* Clear buffer since window size changed */
-    ctx->buffer.clear();
+    ctx->window_samples = (int)(seconds * EFFECTIVE_RATE);
+    ctx->write_pos = 0;
+    ctx->downsample_counter = 0;
+    ctx->ready_buf.store(-1, std::memory_order_relaxed);
     std::strcpy(ctx->detected_key, "---");
 }
 
