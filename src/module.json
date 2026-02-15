@@ -1,0 +1,28 @@
+{
+    "id": "keydetect",
+    "name": "Key Detect",
+    "abbrev": "KD",
+    "version": "0.1.0",
+    "description": "Detects the musical key of audio passing through it",
+    "author": "charlesvestal",
+    "license": "GPL-3.0",
+    "dsp": "keydetect.so",
+    "api_version": 2,
+    "capabilities": {
+        "chainable": true,
+        "component_type": "audio_fx",
+        "ui_hierarchy": {
+            "levels": {
+                "root": {
+                    "label": "KeyDetect",
+                    "children": null,
+                    "knobs": ["window"],
+                    "params": [
+                        {"key": "detected_key", "label": "Key"},
+                        {"key": "window", "label": "Window (s)"}
+                    ]
+                }
+            }
+        }
+    }
+}
