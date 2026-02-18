@@ -38,8 +38,10 @@ static const char* key_names[] = {
 #define DOWNSAMPLE 4
 #define EFFECTIVE_RATE (44100 / DOWNSAMPLE)  /* 11025 Hz */
 
-/* Max buffer: 8 seconds at downsampled rate */
-#define MAX_BUF_SAMPLES (8 * EFFECTIVE_RATE)  /* 88200 samples = ~690 KB */
+/* Max buffer: 8 seconds at downsampled rate, plus headroom for one block */
+#define MAX_BUF_SAMPLES (8 * EFFECTIVE_RATE + 128)
+#define NUM_KEYS 25      /* 24 keys + SILENCE */
+#define VOTE_DECAY 0.6f  /* old votes multiplied by this each new analysis */
 
 struct kd_context {
     /* Ping-pong buffers: audio thread writes to one, analysis reads the other.
@@ -57,8 +59,11 @@ struct kd_context {
     std::thread worker;
     std::atomic<bool> shutdown;
 
-    /* Result */
-    char detected_key[16];
+    /* Result: decaying vote across analyzed windows.
+     * Each new analysis decays old votes by VOTE_DECAY, keeping recent
+     * windows dominant so track changes are picked up quickly. */
+    float votes[NUM_KEYS];              /* vote tally per key (only analysis thread writes) */
+    char detected_key[16];              /* winning key string (updated by analysis thread) */
 
     /* Config */
     int sample_rate;
@@ -99,9 +104,28 @@ static void analysis_thread_fn(kd_context *ctx) {
         /* Run analysis */
         KeyFinder::key_t key = keyfinder.keyOfAudio(audio);
 
-        if (key >= 0 && key <= KeyFinder::SILENCE) {
+        if (key >= 0 && key < KeyFinder::SILENCE) {
+            /* Decay old votes so recent windows dominate */
+            for (int k = 0; k < NUM_KEYS; k++) {
+                ctx->votes[k] *= VOTE_DECAY;
+            }
+
+            /* Cast new vote */
+            ctx->votes[key] += 1.0f;
+
+            /* Find the key with the most votes */
+            int best_key = key;
+            float best_count = 0.0f;
+            for (int k = 0; k < NUM_KEYS - 1; k++) {  /* exclude SILENCE */
+                if (ctx->votes[k] > best_count) {
+                    best_count = ctx->votes[k];
+                    best_key = k;
+                }
+            }
+
+            /* Update displayed key to majority winner */
             char tmp[16];
-            std::strncpy(tmp, key_names[key], sizeof(tmp) - 1);
+            std::strncpy(tmp, key_names[best_key], sizeof(tmp) - 1);
             tmp[sizeof(tmp) - 1] = '\0';
             std::memcpy(ctx->detected_key, tmp, 16);
         }
@@ -123,6 +147,7 @@ void* kd_create(int sample_rate) {
     ctx->ready_buf.store(-1, std::memory_order_relaxed);
     ctx->ready_len.store(0, std::memory_order_relaxed);
     ctx->shutdown.store(false, std::memory_order_relaxed);
+    std::memset(ctx->votes, 0, sizeof(ctx->votes));
     std::strcpy(ctx->detected_key, "---");
 
     ctx->worker = std::thread(analysis_thread_fn, ctx);
@@ -157,20 +182,22 @@ void kd_feed(void *ptr, const int16_t *stereo_audio, int frames) {
             double right = stereo_audio[i * 2 + 1] / 32768.0;
             buf[pos] = (left + right) * 0.5;
             pos++;
+
+            /* Check if we've filled a window */
+            if (pos >= ctx->window_samples) {
+                /* Hand off: only if analysis thread is idle */
+                if (ctx->ready_buf.load(std::memory_order_relaxed) < 0) {
+                    ctx->ready_len.store(pos, std::memory_order_relaxed);
+                    ctx->ready_buf.store(buf_idx, std::memory_order_release);
+                    /* Swap to other buffer — zero copy */
+                    buf_idx = 1 - buf_idx;
+                    ctx->active_buf.store(buf_idx, std::memory_order_relaxed);
+                    buf = ctx->bufs[buf_idx];
+                }
+                pos = 0;
+            }
         }
         ctx->downsample_counter = (ctx->downsample_counter + 1) % DOWNSAMPLE;
-    }
-
-    /* Check if we've filled a window */
-    if (pos >= ctx->window_samples) {
-        /* Hand off: only if analysis thread is idle */
-        if (ctx->ready_buf.load(std::memory_order_relaxed) < 0) {
-            ctx->ready_len.store(pos, std::memory_order_relaxed);
-            ctx->ready_buf.store(buf_idx, std::memory_order_release);
-            /* Swap to other buffer — zero copy */
-            ctx->active_buf.store(1 - buf_idx, std::memory_order_relaxed);
-        }
-        pos = 0;
     }
 
     ctx->write_pos = pos;
@@ -199,6 +226,7 @@ void kd_set_window(void *ptr, float seconds) {
     ctx->write_pos = 0;
     ctx->downsample_counter = 0;
     ctx->ready_buf.store(-1, std::memory_order_relaxed);
+    std::memset(ctx->votes, 0, sizeof(ctx->votes));
     std::strcpy(ctx->detected_key, "---");
 }
 
